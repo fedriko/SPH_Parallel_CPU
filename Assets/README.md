@@ -44,10 +44,6 @@ By setting the cell size equal to the kernel's support radius, we only need to c
 This was the bigest gain in performance from my initial naive aproach.
 
 
-## AI tools
-"I leveraged AI tools during development, particularly for optimizing the data structures and ensuring cache-friendly memory layouts. For instance, the AI suggested using linear arrays with contiguous memory allocation. 
-I verified this approach through literature and found it significantly improved performance, 
-especially when integrated with the Unity Burst Compiler for parallel processing. This allowed me to focus on the mathematical aspects of the simulation while ensuring the underlying implementation was highly efficient.
 
 ## XSPH implementation (NON DISIPATIVE)
 "An improved particle method for incompressible fluid flow" by J. J. Monaghan, published in the Journal of Computational Physics in 1989. 

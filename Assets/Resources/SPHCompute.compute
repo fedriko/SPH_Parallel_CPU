@@ -1,0 +1,488 @@
+// In .compute file
+
+RWStructuredBuffer<float> _densities;
+RWStructuredBuffer<float> _invDensities;
+RWStructuredBuffer<float> _pressures;
+RWStructuredBuffer<float3> _forces;
+RWStructuredBuffer<float3> _xsphDelta;
+RWStructuredBuffer<float3> _positions;
+RWStructuredBuffer<float3> _velocities;
+
+RWStructuredBuffer<int> _gridBound;
+
+StructuredBuffer<int> _nbrStart;
+StructuredBuffer<int> _nbrEnd;
+StructuredBuffer<int> _nbrFlat;
+
+
+
+
+
+
+uint _particleCount;
+float _h;
+float _h2;
+float _mass;
+float _dt;
+
+float _restDensity;
+float _minRatio;
+float _maxRatio;
+
+int _eosType;
+float _soundSpeed;
+float _gamma;
+float _pressureStiff;
+
+float _viscosity;
+float _avEps;
+float _avAlpha;
+float _avBeta;
+
+float _xsphEps;
+float _gravity;
+
+float _maxVelocity;
+float _restDampingThresholdSpeed;
+float _densityErrorThreshold;
+float _restDampingFactor;
+
+float _wendlandCoeff;
+float _viscLapCoeff;
+
+bool _xsphAppliesToPosition;
+bool _useXSPH;
+bool _damp;
+bool _densityClamping;
+
+float3 _boundsSize;
+float _collisionRadius;
+float _collisionDamping;
+
+float3 _boxPosition;
+float3 _linearVelB;
+float3 _angularVelB;
+
+int3 _minCell;
+int3 _maxCell;
+
+float4x4 _rotationMatrixInverse;
+float4x4 _rotationMatrix;
+
+float _cellSize;
+
+inline float WendlandC2(float r2)
+{
+        float ret = 0;
+        if(r2 <_h2){
+            float r = sqrt(r2);
+            float q = r / _h;
+            float oneMinusQ = 1.0 - q;
+            float oneMinusQ4 = oneMinusQ * oneMinusQ * oneMinusQ * oneMinusQ;
+            ret = _wendlandCoeff * oneMinusQ4 * (1.0 + 4.0 * q);
+        }
+        return ret;
+}
+inline float3 WendlandC2Grad(float r2,float3 r)
+    {
+        float3 ret = float3(0,0,0);
+        if (r2 <_h2){
+            float rlen = sqrt(r2);
+            float q = rlen / _h;
+
+            float oneMinusQ = 1.0 - q;
+            float oneMinusQ3 = oneMinusQ * oneMinusQ * oneMinusQ;
+
+
+            float coeff = -20.0 * (_wendlandCoeff / _h)* oneMinusQ3 * (q / rlen);
+
+            ret = coeff * r;
+        }
+        return ret;
+       
+    }
+
+ inline float ViscLaplacian( float rlen)
+    {
+        float ret = 0;
+        if (rlen < _h) 
+            ret = _viscLapCoeff * (_h - rlen);
+        return ret;
+    }
+
+  inline float3 xsphCorrection(float r2,float3 v_ji,
+        float rho_i,float rho_j)
+    {
+        float3 ret = float3(0,0,0);
+        float Wij = WendlandC2(r2);
+        if (Wij >= 1e-4f)
+        {
+            float w = _mass / (0.5f * (rho_i + rho_j));
+            ret =  w * (v_ji) * Wij;
+        }
+        return ret;
+    }
+
+#pragma kernel ComputeDensity
+[numthreads(256, 1, 1)]
+void ComputeDensity(uint3 id : SV_DispatchThreadID)
+{
+
+            if(id.x >= _particleCount)
+                return;
+
+            //Self contribution
+            float density = _mass * WendlandC2(0);
+
+            // Neighbors
+            int start = _nbrStart[id.x];
+            int end = _nbrEnd[id.x];
+            float3 p_i = _positions[id.x];
+            for (int k = start; k < end; k++)
+            {
+
+                int j = _nbrFlat[k];
+                float3 r_ij = p_i- _positions[j];
+                float r2 = dot(r_ij,r_ij);
+                if(r2 >= _h2)
+                    continue;
+
+                density += _mass*WendlandC2(r2);
+            }
+
+            _densities[id.x] = density;
+            _invDensities[id.x] =1.0 / max(density, 1e-6); 
+}
+
+
+#pragma kernel ComputePressure
+[numthreads(256, 1, 1)]
+void ComputePressure(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _particleCount) return;
+
+    float density_i = _densities[idx];
+
+    if (_densityClamping)
+    {
+        density_i = clamp(density_i, _minRatio * _restDensity, _maxRatio * _restDensity);
+    }
+
+    float pressure = 0.0;
+
+    // EOS selection: 0 = Tait, 1 = Linear
+    if (_eosType == 0)
+    {
+        float B = (_soundSpeed * _soundSpeed) * _restDensity / max(_gamma, 1e-6);
+        float r = max(density_i / _restDensity, 1e-8);
+        pressure = B * (pow(r, _gamma) - 1.0);
+    }
+    else // Linear
+    {
+        pressure = _pressureStiff * (density_i - _restDensity);
+    }
+
+    _pressures[idx] = pressure;
+}
+
+
+ inline float3 PressureForceWithArtificialViscosity(float3 r_ij, float p_i,float invRho_i,float p_j
+        , float invRho_j,float vr,float r2)
+    {
+     
+        float3 gradW = WendlandC2Grad(r2,r_ij);
+        float gradMag = length(gradW);
+      
+        // Symmetric pressure
+        float coeffP = _mass * ( p_j * invRho_j * invRho_j + p_i * invRho_i * invRho_i );
+
+
+        // Artificial viscosity (Monaghan)
+        float Pi_ij = 0.0;
+        if (vr < 0.0)
+        {
+            float mu = _h * vr / (r2 + _avEps * _h2);
+            float invRhoAvg = 0.5 * (invRho_i + invRho_j);
+            Pi_ij = (-_avAlpha * _soundSpeed * mu + _avBeta * mu * mu) * invRhoAvg;
+        }
+
+        float coeff = coeffP + _mass * Pi_ij;
+        return -coeff * gradW;
+    }
+
+ inline float3 SymetricMonaghanViscosity (float r2,float3 v_ji,float rho_j,float rho_i)
+    {
+
+        float rlen = sqrt(r2);
+        float lapW = ViscLaplacian(rlen);
+        float invRhoProd = 1.0/(rho_j * rho_i);
+        float avgInvRho = 2.0/(rho_i + rho_j);
+
+        return _viscosity * _mass * invRhoProd * (v_ji) * lapW;
+    }
+
+#pragma kernel ComputeForcesWithXSPH
+[numthreads(256, 1, 1)]
+void ComputeForcesWithXSPH(uint3 id : SV_DispatchThreadID)
+{
+    if(id.x >= _particleCount)
+        return;
+    
+    float3 pos_i = _positions[id.x];
+    float3 vel_i = _velocities[id.x];
+    float p_i = _pressures[id.x];
+    float invRho_i = _invDensities[id.x];
+    float rho_i = max(_densities[id.x], 1e-6f);
+
+    // Accumulators for all three computations
+    float3 pressureForce = 0;
+    float3 viscosityForce = 0;
+    float3 xsphCorr = 0;
+
+    int s = _nbrStart[id.x], e = _nbrEnd[id.x];
+
+    for (int idx = s; idx < e; idx++)
+    {
+        int j = _nbrFlat[idx];
+
+
+        float3 r_ij = pos_i - _positions[j];
+        float r2 = dot(r_ij,r_ij);
+
+
+        if (r2 >= _h2 || r2 <= 1e-12)
+            continue;
+
+
+        float invRho_j = _invDensities[j];
+        float rho_j = max(_densities[j], 1e-6);
+
+        float p_j = _pressures[j];
+        float3 v_ij = vel_i - _velocities[j];
+        float vr = dot(v_ij, r_ij);
+
+
+        //Compute pressure and viscosity artificial
+        pressureForce += PressureForceWithArtificialViscosity(r_ij, p_i, invRho_i, p_j, invRho_j, vr, r2);
+
+
+        // Physical viscosity
+        float3 v_ji = -v_ij;
+        viscosityForce += SymetricMonaghanViscosity(r2, v_ji, rho_j , rho_i);
+
+
+        //  XSPH
+        xsphCorr += xsphCorrection( r2, v_ji, rho_i, rho_j);
+    }
+
+    // Accumulate all forces
+    float3 g = float3(0,_gravity,0);
+    _forces[id.x] = pressureForce + (_viscosity * viscosityForce)
+        + (_mass * g);
+    _xsphDelta[id.x] = _xsphEps * xsphCorr;
+}
+
+
+#pragma kernel Integrate
+[numthreads(256, 1, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _particleCount)
+        return;
+    
+    uint i = id.x;
+    
+    // Read current state
+    float3 vel = _velocities[i];
+    float3 pos = _positions[i];
+    float3 force = _forces[i];
+    float3 xsph = _xsphDelta[i];
+    float density = _densities[i];
+
+    // 1. Integrate velocity
+    float invMass = 1.0 / _mass;
+    vel += _dt * invMass * force;
+    
+    // 2. Apply XSPH to velocity (if configured)
+    if (_useXSPH && !_xsphAppliesToPosition)
+        vel += xsph;
+    
+    // 3. Clamp velocity magnitude
+    float speedSq = dot(vel, vel);
+    float maxSpeedSq = _maxVelocity * _maxVelocity;
+    if (speedSq > maxSpeedSq && speedSq > 0)
+    {
+        float speed = sqrt(speedSq);
+        vel *= (_maxVelocity / speed);
+    }
+    
+    // 4. Density damping
+    if (_damp)
+    {
+        float speed = length(vel);
+        float densityError = abs(density - _restDensity) / max(_restDensity, 1e-6);
+        
+        if (speed < _restDampingThresholdSpeed && densityError < _densityErrorThreshold)
+        {
+            vel *= _restDampingFactor;
+        }
+    }
+    
+    // 5. Integrate position
+     pos = pos + _dt * vel;
+    
+    // 6. Apply XSPH to position (if configured)
+    if (_xsphAppliesToPosition && _useXSPH)
+        pos += _dt * xsph;
+    
+    // 7. COLLISION HANDLING
+    float3 halfSize = _boundsSize * 0.5;
+    float3 relPos = pos - _boxPosition;
+    
+    // Transform to local space
+    float3 localPos = mul((float3x3)_rotationMatrixInverse, relPos);
+    
+    float3 minL = -halfSize + _collisionRadius;
+    float3 maxL = halfSize - _collisionRadius;
+    
+    float3 nLocal = float3(0, 0, 0);
+    float3 pNewLocal = localPos;
+    
+    // Check boundaries on each axis
+    if (pNewLocal.x < minL.x)
+    {
+        pNewLocal.x = minL.x;
+        nLocal.x = 1.0;
+    }
+    else if (pNewLocal.x > maxL.x)
+    {
+        pNewLocal.x = maxL.x;
+        nLocal.x = -1.0;
+    }
+    
+    if (pNewLocal.y < minL.y)
+    {
+        pNewLocal.y = minL.y;
+        nLocal.y = 1.0;
+    }
+    else if (pNewLocal.y > maxL.y)
+    {
+        pNewLocal.y = maxL.y;
+        nLocal.y = -1.0;
+    }
+    
+    if (pNewLocal.z < minL.z)
+    {
+        pNewLocal.z = minL.z;
+        nLocal.z = 1.0;
+    }
+    else if (pNewLocal.z > maxL.z)
+    {
+        pNewLocal.z = maxL.z;
+        nLocal.z = -1.0;
+    }
+    
+    // Apply collision response if there was penetration
+    float nLengthSq = dot(nLocal, nLocal);
+    if (nLengthSq > 0)
+    {
+        nLocal = normalize(nLocal);
+        
+        // Transform corrected position back to world space
+        float3 pNewWorld = mul((float3x3)_rotationMatrix, pNewLocal) + _boxPosition;
+        
+        // Calculate box velocity at contact point
+        float3 dCenter = pNewWorld - _boxPosition;
+        float3 vBox = _linearVelB + cross(_angularVelB, dCenter);
+        
+        // Relative velocity
+        float3 vRel = vel - vBox;
+        
+        // Normal in world space
+        float3 nWorld = normalize(mul((float3x3)_rotationMatrix, nLocal));
+        
+        // Check if moving into the wall
+        float vRelN = dot(vRel, nWorld);
+        if (vRelN < 0)
+        {
+            // Separate normal and tangential components
+            float3 vN = vRelN * nWorld;
+            float3 vT = vRel - vN;
+            
+            // Apply collision response (with damping on normal component)
+            vRel = -(1.0 - _collisionDamping) * vN + vT;
+        }
+        
+        // Transform back to world frame
+        vel = vRel + vBox;
+        pos = pNewWorld;
+        
+        // CRITICAL: Clamp velocity again after collision
+        speedSq = dot(vel, vel);
+        if (speedSq > maxSpeedSq && speedSq > 0)
+        {
+            float speed = sqrt(speedSq);
+            vel *= (_maxVelocity / speed);
+        }
+    }
+  
+    // 9. Write results
+    _velocities[i] = vel;
+    _positions[i] = pos;
+}
+// Grid 
+
+//Initialize minMax values to be really small
+#pragma kernel gridMaxMin 
+[numthreads(256,1,1)]
+void gridMaxMin(uint3 id: SV_DispatchThreadID){
+    
+    if(id.x >= _particleCount)
+        return;
+
+    float3 p = _positions[id.x];
+    float invCellSize = 1.0/_cellSize;
+    int3 c = (int3)floor(p* invCellSize);
+
+    InterlockedMin(_gridBound[0], c.x);
+    InterlockedMin(_gridBound[1], c.y);
+    InterlockedMin(_gridBound[2], c.z);
+
+    InterlockedMax(_gridBound[3], c.x);
+    InterlockedMax(_gridBound[4], c.y);
+    InterlockedMax(_gridBound[5], c.z);
+        
+}
+#pragma kernel linCellId 
+[numthreads(256,1,1)]
+void linCellId(uint3 id: SV_DispatchThreadID){
+    int i = id.x;
+    if(i>=_particleCount)
+        return;
+    
+}
+
+
+// single-thread kernel
+[numthreads(1,1,1)]
+void ComputeGridDimensions(uint3 id : SV_DispatchThreadID)
+{
+    int minCx = _gridBound[0];
+    int minCy = _gridBound[1];
+    int minCz = _gridBound[2];
+    int maxCx = _gridBound[3];
+    int maxCy = _gridBound[0];
+    int maxCz = _gridBound[5];
+
+    int sx = maxCx - minCx + 1;
+    int sy = maxCy - minCy + 1;
+    int sz = maxCz - minCz + 1;
+
+    int total = sx * sy * sz;
+
+   // _dimBuffer[0] = sx;
+   // _dimBuffer[1] = sy;
+  //  _dimBuffer[2] = sz;
+   // _dimBuffer[3] = total;
+}
